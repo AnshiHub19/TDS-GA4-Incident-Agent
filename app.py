@@ -4,6 +4,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 DB_PATH = os.getenv("DB_PATH", "incident_agent.db")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
