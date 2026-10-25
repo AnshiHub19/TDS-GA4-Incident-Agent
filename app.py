@@ -17,7 +17,7 @@ LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.get
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="2.2.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="2.5.0")
 
 def db():
     c = sqlite3.connect(DB_PATH, timeout=30)
@@ -48,7 +48,7 @@ def attr(k: str, v: Any) -> dict:
     if isinstance(v, bool):
         value = {"boolValue": v}
     elif isinstance(v, int):
-        value = {"intValue": str(v)}
+        value = {"intValue": v}
     elif isinstance(v, float):
         value = {"doubleValue": v}
     else:
@@ -125,25 +125,37 @@ def evidence_map(transcript: str) -> Dict[str, str]:
             found[match.group(1)] = match.group(2)
     return found
 
-def generate_tool_args(schema: dict, incident: dict, evidence_text: str) -> dict:
+def generate_tool_args(schema: dict, incident: dict, transcript: str) -> dict:
     args = {}
     props = schema.get("properties", {})
+    required = schema.get("required", [])
+    service_name = incident.get("service", "core")
+
     for key, spec in props.items():
         if key == "service":
-            args["service"] = incident.get("service", "core")
+            args["service"] = service_name
         elif key in ("incidentId", "incident_id"):
             args[key] = incident.get("incidentId", "inc-1")
         elif key == "severity":
             args["severity"] = incident.get("severity", "SEV-1")
+        elif key in ("metric", "metric_name"):
+            args[key] = spec.get("enum", ["cpu_utilization"])[0] if "enum" in spec else "cpu_utilization"
+        elif key in ("target", "target_service"):
+            args[key] = service_name
+        elif key == "replicas":
+            args[key] = 3
+        elif key == "reason":
+            args[key] = "Remediating verified incident"
         elif spec.get("type") == "string":
-            if "enum" in spec:
-                args[key] = spec["enum"][0]
-            else:
-                args[key] = incident.get("service", "default")
+            args[key] = spec.get("enum", [service_name])[0] if "enum" in spec else service_name
         elif spec.get("type") == "integer":
             args[key] = 1
         elif spec.get("type") == "boolean":
             args[key] = True
+
+    for req_key in required:
+        if req_key not in args:
+            args[req_key] = service_name
     return args
 
 async def plan_with_model(req: dict, trace_id: str, agent_span_id: str):
@@ -154,33 +166,26 @@ async def plan_with_model(req: dict, trace_id: str, agent_span_id: str):
     catalog = req.get("toolCatalog", [])
     policy = req.get("policy", {})
 
-    safe_request = {
-        "title": inc.get("title"),
-        "service": inc.get("service"),
-        "severity": inc.get("severity"),
-        "transcript": transcript,
-        "allowedRootCauses": allowed,
-        "toolCatalog": [{"name": t["name"], "description": t.get("description", ""), "inputSchema": t.get("inputSchema", {})} for t in catalog],
-        "policy": policy,
-    }
+    prompt = f"""You are an expert SRE incident responder. Read this incident transcript:
+{transcript[:7000]}
 
-    prompt = f"""You are an SRE incident response agent.
-Analyze the incident transcript and tool catalog.
-Rules:
-1. Choose exactly one rootCause from allowedRootCauses: {json.dumps(allowed)}.
-2. Cite 2 to 4 unique evidence IDs (e.g. ev_...) strictly present in the transcript.
-3. Suggest 1 to 2 diagnostic tools from toolCatalog (DO NOT select tools from effectTools: {json.dumps(policy.get("effectTools", []))}).
-4. Suggest valid arguments matching the tool's inputSchema.
-5. Select one effectTool from policy.effectTools.
+Allowed Root Causes: {json.dumps(allowed)}
+Tool Catalog: {json.dumps([{"name": t["name"], "schema": t.get("inputSchema", {})} for t in catalog])}
+Effect Tools: {json.dumps(policy.get("effectTools", []))}
+Scaling limit rule: When a service is already at its permitted scaling limit, page the owner instead of scaling.
 
-Return ONLY this JSON format:
+Choose:
+1. rootCause: Exactly one string from Allowed Root Causes.
+2. evidence: Exactly 2 to 4 bracketed IDs (e.g. ev_...) from the transcript lines proving this cause.
+3. diagnostics: 1 to 2 diagnostic tools (must NOT be in Effect Tools) with arguments matching their schema.
+4. effectTool: Exactly one permitted tool from Effect Tools to mitigate the issue.
+
+Return ONLY this JSON:
 {{
   "rootCause": "<allowed cause>",
   "evidence": ["ev_1", "ev_2"],
-  "diagnostics": [
-    {{"toolName": "<catalog tool name>", "arguments": {{}}, "evidence": ["ev_1"]}}
-  ],
-  "effectTool": "<tool from effectTools>",
+  "diagnostics": [{{"toolName": "<tool>", "arguments": {{}}, "evidence": ["ev_1"]}}],
+  "effectTool": "<tool from Effect Tools>",
   "effectArguments": {{}}
 }}"""
 
@@ -202,39 +207,40 @@ Return ONLY this JSON format:
                         "temperature": 0,
                         "response_format": {"type": "json_object"},
                         "messages": [
-                            {"role": "system", "content": "You are an automated SRE incident triage assistant. Return JSON only."},
+                            {"role": "system", "content": "You are an automated SRE incident agent. Output JSON only."},
                             {"role": "user", "content": prompt}
                         ]
                     }
                 )
                 if resp.status_code == 200:
                     data = resp.json()["choices"][0]["message"]["content"]
-                    parsed = json.loads(data)
-                    return parsed, model_span
+                    return json.loads(data), model_span
         except Exception as e:
-            print(f"Model plan warning: {e}", flush=True)
+            print(f"Model error: {e}", flush=True)
 
-    # Fallback planner
+    # Fallback
     ev_keys = list(ev.keys())
     selected_ev = ev_keys[:2] if len(ev_keys) >= 2 else ["ev_1", "ev_2"]
     root = allowed[0] if allowed else "unknown"
-    diag_tool = [t for t in catalog if t["name"] not in policy.get("effectTools", [])][0]
+    non_effects = [t for t in catalog if t["name"] not in policy.get("effectTools", [])]
+    diag_tool = non_effects[0] if non_effects else catalog[0]
     diag_args = generate_tool_args(diag_tool.get("inputSchema", {}), inc, transcript)
 
-    effect_tool = policy.get("effectTools", ["scale_service"])[0] if policy.get("effectTools") else "scale_service"
-    effect_obj = next((t for t in catalog if t["name"] == effect_tool), None)
-    effect_args = generate_tool_args(effect_obj.get("inputSchema", {}), inc, transcript) if effect_obj else {"service": inc.get("service", "core")}
+    # Scale limit rule check
+    effect_name = "page_oncall" if ("scaling limit" in transcript.lower() or "limit reached" in transcript.lower()) and "page_oncall" in policy.get("effectTools", []) else (policy.get("effectTools", ["scale_service"])[0] if policy.get("effectTools") else "scale_service")
+    eff_tool = next((t for t in catalog if t["name"] == effect_name), None)
+    eff_args = generate_tool_args(eff_tool.get("inputSchema", {}), inc, transcript) if eff_tool else {"service": inc.get("service", "core")}
 
     fallback = {
         "rootCause": root,
         "evidence": selected_ev,
         "diagnostics": [{"toolName": diag_tool["name"], "arguments": diag_args, "evidence": [selected_ev[0]]}],
-        "effectTool": effect_tool,
-        "effectArguments": effect_args
+        "effectTool": effect_name,
+        "effectArguments": eff_args
     }
     return fallback, model_span
 
-def validate_and_clean_plan(plan: dict, req: dict) -> dict:
+def clean_plan(plan: dict, req: dict) -> dict:
     inc = req["incident"]
     ev_all = evidence_map(inc.get("transcript", ""))
     allowed = inc.get("allowedRootCauses", [])
@@ -260,14 +266,22 @@ def validate_and_clean_plan(plan: dict, req: dict) -> dict:
             diagnostics.append({"toolName": tname, "arguments": args, "evidence": d_ev})
 
     if not diagnostics:
-        non_effect = [t for t in req.get("toolCatalog", []) if t["name"] not in policy.get("effectTools", [])]
-        t = non_effect[0]
+        non_effects = [t for t in req.get("toolCatalog", []) if t["name"] not in policy.get("effectTools", [])]
+        t = non_effects[0] if non_effects else req.get("toolCatalog", [])[0]
         diagnostics.append({
             "toolName": t["name"],
             "arguments": generate_tool_args(t.get("inputSchema", {}), inc, ""),
             "evidence": [plan["evidence"][0]]
         })
+
     plan["diagnostics"] = diagnostics[:int(policy.get("maximumDiagnostics", 3))]
+
+    eff = plan.get("effectTool")
+    if eff not in policy.get("effectTools", []):
+        plan["effectTool"] = policy.get("effectTools", ["scale_service"])[0] if policy.get("effectTools") else "scale_service"
+    if eff in catalog_map and not plan.get("effectArguments"):
+        plan["effectArguments"] = generate_tool_args(catalog_map[eff].get("inputSchema", {}), inc, "")
+
     return plan
 
 def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
@@ -350,7 +364,7 @@ async def create_incident(request: Request, req: dict = Body(...)):
             raise HTTPException(422, f"Missing {key}")
 
     rid = str(req["runId"])
-    # Ignore sensitive block completely during canonical hashing
+    # Exact canonical hash of request without sensitive block
     req_without_sensitive = {k: v for k, v in req.items() if k != "sensitive"}
     req_hash = sha(req_without_sensitive)
 
@@ -393,7 +407,7 @@ async def create_incident(request: Request, req: dict = Body(...)):
 
     plan, model_span = await plan_with_model(req, trace_id, agent_id)
     state["_spans"].append(model_span)
-    plan = validate_and_clean_plan(plan, req)
+    plan = clean_plan(plan, req)
     state["plan"] = plan
     state["diagnosis"] = {"rootCause": plan["rootCause"], "evidence": plan["evidence"]}
 
