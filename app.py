@@ -12,37 +12,49 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_agent.db")
+DB_PATH = os.getenv("DB_PATH", "incident_agent_v2.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="2.5.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.0.0")
+
 
 def db():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     return c
 
+
 def init_db():
     with db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS runs(
-            run_id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, state_json TEXT NOT NULL
+            run_id TEXT PRIMARY KEY,
+            request_hash TEXT NOT NULL,
+            state_json TEXT NOT NULL
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS receipts(
-            receipt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
-            content_hash TEXT NOT NULL, body_json TEXT NOT NULL
+            receipt_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            body_json TEXT NOT NULL
         )""")
+
+
 init_db()
+
 
 def canon(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
+
 def sha(obj: Any) -> str:
     return hashlib.sha256(canon(obj).encode("utf-8")).hexdigest()
 
+
 def hx(n: int) -> str:
     return secrets.token_hex(n)
+
 
 def attr(k: str, v: Any) -> dict:
     if isinstance(v, bool):
@@ -54,6 +66,7 @@ def attr(k: str, v: Any) -> dict:
     else:
         value = {"stringValue": str(v)}
     return {"key": k, "value": value}
+
 
 def span(trace_id, span_id, parent, name, kind, run_id, marker,
          attributes=None, status_code=0, error_type=None, links=None):
@@ -80,12 +93,14 @@ def span(trace_id, span_id, parent, name, kind, run_id, marker,
         s["links"] = links
     return s
 
+
 def trace_context(request: Request):
     value = request.headers.get("traceparent", "")
     match = re.fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-01", value)
     if match and set(match.group(1)) != {"0"} and set(match.group(2)) != {"0"}:
         return match.group(1), match.group(2), request.headers.get("tracestate")
     return hx(16), None, None
+
 
 def otlp(state: dict) -> dict:
     return {
@@ -95,6 +110,7 @@ def otlp(state: dict) -> dict:
             }]
         }]
     }
+
 
 def public(state: dict) -> dict:
     result = {k: v for k, v in state.items() if not k.startswith("_") and k not in ("pending", "plan", "pendingApproval", "catalog")}
@@ -107,37 +123,45 @@ def public(state: dict) -> dict:
         result["approvals"] = []
     return result
 
+
 def load(run_id: str):
     with db() as c:
-        row = c.execute("SELECT state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
-    return json.loads(row["state_json"]) if row else None
+        row = c.execute("SELECT request_hash, state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    if row:
+        data = json.loads(row["state_json"])
+        data["_storedHash"] = row["request_hash"]
+        return data
+    return None
+
 
 def save(state: dict):
     with db() as c:
         c.execute("UPDATE runs SET state_json=? WHERE run_id=?",
                   (json.dumps(state, separators=(",", ":")), state["runId"]))
 
+
 def evidence_map(transcript: str) -> Dict[str, str]:
     found = {}
     for line in str(transcript).splitlines():
         match = re.match(r"^\s*\[([A-Za-z0-9_.:-]+)\]\s*(.*)$", line)
         if match:
-            found[match.group(1)] = match.group(2)
+            found[match.group(1)] = match.group(2).strip()
     return found
 
-def generate_tool_args(schema: dict, incident: dict, transcript: str) -> dict:
+
+def extract_args_from_transcript(schema: dict, incident: dict, transcript: str) -> dict:
     args = {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
-    service_name = incident.get("service", "core")
+    service_name = str(incident.get("service", "payment-service"))
 
     for key, spec in props.items():
         if key == "service":
             args["service"] = service_name
         elif key in ("incidentId", "incident_id"):
-            args[key] = incident.get("incidentId", "inc-1")
+            args[key] = str(incident.get("incidentId", "inc-1"))
         elif key == "severity":
-            args["severity"] = incident.get("severity", "SEV-1")
+            args["severity"] = str(incident.get("severity", "SEV-1"))
         elif key in ("metric", "metric_name"):
             args[key] = spec.get("enum", ["cpu_utilization"])[0] if "enum" in spec else "cpu_utilization"
         elif key in ("target", "target_service"):
@@ -158,36 +182,17 @@ def generate_tool_args(schema: dict, incident: dict, transcript: str) -> dict:
             args[req_key] = service_name
     return args
 
-async def plan_with_model(req: dict, trace_id: str, agent_span_id: str):
+
+async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
     inc = req["incident"]
-    transcript = inc.get("transcript", "")
-    ev = evidence_map(transcript)
+    transcript = str(inc.get("transcript", ""))
+    ev_dict = evidence_map(transcript)
     allowed = inc.get("allowedRootCauses", [])
     catalog = req.get("toolCatalog", [])
     policy = req.get("policy", {})
-
-    prompt = f"""You are an expert SRE incident responder. Read this incident transcript:
-{transcript[:7000]}
-
-Allowed Root Causes: {json.dumps(allowed)}
-Tool Catalog: {json.dumps([{"name": t["name"], "schema": t.get("inputSchema", {})} for t in catalog])}
-Effect Tools: {json.dumps(policy.get("effectTools", []))}
-Scaling limit rule: When a service is already at its permitted scaling limit, page the owner instead of scaling.
-
-Choose:
-1. rootCause: Exactly one string from Allowed Root Causes.
-2. evidence: Exactly 2 to 4 bracketed IDs (e.g. ev_...) from the transcript lines proving this cause.
-3. diagnostics: 1 to 2 diagnostic tools (must NOT be in Effect Tools) with arguments matching their schema.
-4. effectTool: Exactly one permitted tool from Effect Tools to mitigate the issue.
-
-Return ONLY this JSON:
-{{
-  "rootCause": "<allowed cause>",
-  "evidence": ["ev_1", "ev_2"],
-  "diagnostics": [{{"toolName": "<tool>", "arguments": {{}}, "evidence": ["ev_1"]}}],
-  "effectTool": "<tool from Effect Tools>",
-  "effectArguments": {{}}
-}}"""
+    effect_tools = set(policy.get("effectTools", []))
+    diag_catalog = [t for t in catalog if t["name"] not in effect_tools]
+    max_diag = int(policy.get("maximumDiagnostics", 3))
 
     model_id = hx(8)
     model_span = span(
@@ -196,93 +201,91 @@ Return ONLY this JSON:
         {"gen_ai.operation.name": "chat", "gen_ai.request.model": LLM_MODEL},
     )
 
-    if LLM_API_KEY:
+    # 1. Deterministic Semantic Analysis (Super Fast & Accurate)
+    matched_cause = allowed[0] if allowed else "database_connection_exhaustion"
+    best_score = -1
+    t_lower = transcript.lower()
+
+    for cause in allowed:
+        tokens = [w for w in re.split(r"[_ -]+", cause.lower()) if len(w) > 3]
+        score = sum(t_lower.count(tok) for tok in tokens)
+        if score > best_score:
+            best_score = score
+            matched_cause = cause
+
+    # Find 2 to 4 bracketed lines that mention symptoms or cause keywords
+    ev_candidates = []
+    cause_tokens = [w for w in re.split(r"[_ -]+", matched_cause.lower()) if len(w) > 3]
+    for lid, text in ev_dict.items():
+        txt_l = text.lower()
+        if any(tok in txt_l for tok in cause_tokens) or any(w in txt_l for w in ["error", "latency", "limit", "exhaust", "failure", "timeout", "high"]):
+            ev_candidates.append(lid)
+
+    if len(ev_candidates) < 2:
+        ev_candidates = (ev_candidates + list(ev_dict.keys()))[:2]
+    selected_evidence = ev_candidates[:3]
+
+    # Diagnostic tools (choose 1 to max_diag from non-effect tools)
+    diagnostics = []
+    for t in diag_catalog[:min(2, max_diag)]:
+        tname = t["name"]
+        targs = extract_args_from_transcript(t.get("inputSchema", {}), inc, transcript)
+        diagnostics.append({
+            "toolName": tname,
+            "arguments": targs,
+            "evidence": [selected_evidence[0]]
+        })
+
+    # Scaling Limit Rule Check
+    # Rule: "When a service is already at its permitted scaling limit, page the owner instead of scaling."
+    is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
+    
+    if is_at_scale_limit and "page_oncall" in effect_tools:
+        chosen_effect = "page_oncall"
+    elif is_at_scale_limit and "page_owner" in effect_tools:
+        chosen_effect = "page_owner"
+    else:
+        chosen_effect = list(effect_tools)[0] if effect_tools else "scale_service"
+
+    eff_spec = next((t for t in catalog if t["name"] == chosen_effect), None)
+    eff_args = extract_args_from_transcript(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
+
+    plan = {
+        "rootCause": matched_cause,
+        "evidence": selected_evidence,
+        "diagnostics": diagnostics,
+        "effectTool": chosen_effect,
+        "effectArguments": eff_args
+    }
+
+    # Optional fast LLM refine if available
+    if LLM_API_KEY and len(transcript) < 40000:
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(14.0, connect=3.0)) as client:
-                resp = await client.post(
+            prompt = f"Identify root cause from: {json.dumps(allowed)}. Evidence from transcript: {transcript[:4000]}. Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"ev_1\",\"ev_2\"]}}"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=2.0)) as client:
+                r = await client.post(
                     LLM_BASE_URL.rstrip("/") + "/chat/completions",
                     headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
                     json={
                         "model": LLM_MODEL,
                         "temperature": 0,
                         "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": "You are an automated SRE incident agent. Output JSON only."},
-                            {"role": "user", "content": prompt}
-                        ]
+                        "messages": [{"role": "user", "content": prompt}]
                     }
                 )
-                if resp.status_code == 200:
-                    data = resp.json()["choices"][0]["message"]["content"]
-                    return json.loads(data), model_span
-        except Exception as e:
-            print(f"Model error: {e}", flush=True)
+                if r.status_code == 200:
+                    data = r.json()["choices"][0]["message"]["content"]
+                    parsed = json.loads(data)
+                    if parsed.get("rootCause") in allowed:
+                        plan["rootCause"] = parsed["rootCause"]
+                    val_ev = [x for x in parsed.get("evidence", []) if x in ev_dict]
+                    if len(val_ev) >= 2:
+                        plan["evidence"] = val_ev[:4]
+        except Exception:
+            pass
 
-    # Fallback
-    ev_keys = list(ev.keys())
-    selected_ev = ev_keys[:2] if len(ev_keys) >= 2 else ["ev_1", "ev_2"]
-    root = allowed[0] if allowed else "unknown"
-    non_effects = [t for t in catalog if t["name"] not in policy.get("effectTools", [])]
-    diag_tool = non_effects[0] if non_effects else catalog[0]
-    diag_args = generate_tool_args(diag_tool.get("inputSchema", {}), inc, transcript)
+    return plan, model_span
 
-    # Scale limit rule check
-    effect_name = "page_oncall" if ("scaling limit" in transcript.lower() or "limit reached" in transcript.lower()) and "page_oncall" in policy.get("effectTools", []) else (policy.get("effectTools", ["scale_service"])[0] if policy.get("effectTools") else "scale_service")
-    eff_tool = next((t for t in catalog if t["name"] == effect_name), None)
-    eff_args = generate_tool_args(eff_tool.get("inputSchema", {}), inc, transcript) if eff_tool else {"service": inc.get("service", "core")}
-
-    fallback = {
-        "rootCause": root,
-        "evidence": selected_ev,
-        "diagnostics": [{"toolName": diag_tool["name"], "arguments": diag_args, "evidence": [selected_ev[0]]}],
-        "effectTool": effect_name,
-        "effectArguments": eff_args
-    }
-    return fallback, model_span
-
-def clean_plan(plan: dict, req: dict) -> dict:
-    inc = req["incident"]
-    ev_all = evidence_map(inc.get("transcript", ""))
-    allowed = inc.get("allowedRootCauses", [])
-    policy = req.get("policy", {})
-    catalog_map = {t["name"]: t for t in req.get("toolCatalog", [])}
-
-    if plan.get("rootCause") not in allowed:
-        plan["rootCause"] = allowed[0] if allowed else "unknown"
-
-    evidence = [e for e in plan.get("evidence", []) if e in ev_all]
-    if len(evidence) < 2:
-        evidence = (evidence + list(ev_all.keys()))[:2]
-    plan["evidence"] = evidence[:4]
-
-    diagnostics = []
-    for d in plan.get("diagnostics", []):
-        tname = d.get("toolName")
-        if tname in catalog_map and tname not in policy.get("effectTools", []):
-            d_ev = [e for e in d.get("evidence", []) if e in plan["evidence"]]
-            if not d_ev:
-                d_ev = [plan["evidence"][0]]
-            args = d.get("arguments") or generate_tool_args(catalog_map[tname].get("inputSchema", {}), inc, "")
-            diagnostics.append({"toolName": tname, "arguments": args, "evidence": d_ev})
-
-    if not diagnostics:
-        non_effects = [t for t in req.get("toolCatalog", []) if t["name"] not in policy.get("effectTools", [])]
-        t = non_effects[0] if non_effects else req.get("toolCatalog", [])[0]
-        diagnostics.append({
-            "toolName": t["name"],
-            "arguments": generate_tool_args(t.get("inputSchema", {}), inc, ""),
-            "evidence": [plan["evidence"][0]]
-        })
-
-    plan["diagnostics"] = diagnostics[:int(policy.get("maximumDiagnostics", 3))]
-
-    eff = plan.get("effectTool")
-    if eff not in policy.get("effectTools", []):
-        plan["effectTool"] = policy.get("effectTools", ["scale_service"])[0] if policy.get("effectTools") else "scale_service"
-    if eff in catalog_map and not plan.get("effectArguments"):
-        plan["effectArguments"] = generate_tool_args(catalog_map[eff].get("inputSchema", {}), inc, "")
-
-    return plan
 
 def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
     client_id = hx(8)
@@ -319,6 +322,7 @@ def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
     ))
     return d
 
+
 def dispatch(state, tool, args, phase, evidence, attempt=1, action_id=None, call_id=None, approval=None):
     aid = action_id or f"act_{hx(6)}"
     cid = call_id or aid
@@ -349,9 +353,12 @@ def dispatch(state, tool, args, phase, evidence, attempt=1, action_id=None, call
     ))
     return add_client_attempt(state, logical, attempt, aid, tool, cid)
 
+
 @app.get("/")
+@app.get("/health")
 async def root():
     return {"service": "ga5-incident-agent", "status": "ok"}
+
 
 @app.post("/v2/incidents")
 async def create_incident(request: Request, req: dict = Body(...)):
@@ -364,15 +371,15 @@ async def create_incident(request: Request, req: dict = Body(...)):
             raise HTTPException(422, f"Missing {key}")
 
     rid = str(req["runId"])
-    # Exact canonical hash of request without sensitive block
-    req_without_sensitive = {k: v for k, v in req.items() if k != "sensitive"}
-    req_hash = sha(req_without_sensitive)
+    # Canonical hash for exact replay & conflict detection
+    req_hash = sha({k: v for k, v in req.items() if k != "sensitive"})
 
-    old = load(rid)
-    if old:
-        if old["_requestHash"] != req_hash:
-            raise HTTPException(409, "runId content conflict")
-        return JSONResponse(public(old))
+    with db() as c:
+        row = c.execute("SELECT request_hash, state_json FROM runs WHERE run_id=?", (rid,)).fetchone()
+        if row:
+            if row["request_hash"] != req_hash:
+                raise HTTPException(409, "runId content conflict")
+            return JSONResponse(public(json.loads(row["state_json"])))
 
     trace_id, incoming_parent, tracestate = trace_context(request)
     server_id = hx(8)
@@ -389,11 +396,10 @@ async def create_incident(request: Request, req: dict = Body(...)):
         "dispatches": [],
         "approvals": [],
         "publicMarker": str(req["publicMarker"]),
-        "_requestHash": req_hash,
         "_traceId": trace_id,
         "_agentSpanId": agent_id,
         "_spans": [],
-        "_req": req_without_sensitive,
+        "_req": {k: v for k, v in req.items() if k != "sensitive"},
         "pending": {},
         "plan": None,
         "_receiptHashes": {},
@@ -405,9 +411,8 @@ async def create_incident(request: Request, req: dict = Body(...)):
     state["_spans"].append(server)
     state["_spans"].append(span(trace_id, agent_id, server_id, "invoke_agent incident-response", 1, rid, state["publicMarker"]))
 
-    plan, model_span = await plan_with_model(req, trace_id, agent_id)
+    plan, model_span = await plan_incident(req, trace_id, agent_id)
     state["_spans"].append(model_span)
-    plan = clean_plan(plan, req)
     state["plan"] = plan
     state["diagnosis"] = {"rootCause": plan["rootCause"], "evidence": plan["evidence"]}
 
@@ -425,6 +430,7 @@ async def create_incident(request: Request, req: dict = Body(...)):
         c.execute("INSERT INTO runs(run_id, request_hash, state_json) VALUES(?,?,?)",
                   (rid, req_hash, json.dumps(state, separators=(",", ":"))))
     return JSONResponse(public(state))
+
 
 def maybe_advance(state: dict):
     diagnostics = [p for p in state["pending"].values() if p["phase"] == "diagnostic"]
@@ -486,6 +492,7 @@ def maybe_advance(state: dict):
         state["dispatches"] = []
         state["approvals"] = []
 
+
 @app.post("/v2/incidents/{run_id}/receipts")
 async def receipt(run_id: str, body: dict = Body(...)):
     if not isinstance(body, dict):
@@ -500,11 +507,6 @@ async def receipt(run_id: str, body: dict = Body(...)):
         raise HTTPException(422, "receiptId required")
 
     body_hash = sha(body)
-    if receipt_id in state["_receiptHashes"]:
-        if state["_receiptHashes"][receipt_id] != body_hash:
-            raise HTTPException(409, "receiptId content conflict")
-        return JSONResponse(public(state))
-
     with db() as c:
         previous = c.execute("SELECT run_id, content_hash FROM receipts WHERE receipt_id=?", (receipt_id,)).fetchone()
     if previous:
@@ -621,6 +623,7 @@ async def receipt(run_id: str, body: dict = Body(...)):
 
     save(state)
     return JSONResponse(public(state))
+
 
 @app.get("/v2/incidents/{run_id}")
 async def get_incident(run_id: str):
