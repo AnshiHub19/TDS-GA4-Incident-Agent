@@ -12,12 +12,12 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_v4.db")
+DB_PATH = os.getenv("DB_PATH", "incident_v5.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.2.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.3.0")
 
 
 def db():
@@ -32,13 +32,14 @@ def init_db():
             run_id TEXT PRIMARY KEY,
             request_hash TEXT NOT NULL,
             state_json TEXT NOT NULL,
-            last_response TEXT NOT NULL
+            initial_response TEXT NOT NULL,
+            current_response TEXT NOT NULL
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS receipts(
             receipt_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
             content_hash TEXT NOT NULL,
-            body_json TEXT NOT NULL
+            response_json TEXT NOT NULL
         )""")
 
 
@@ -113,27 +114,34 @@ def otlp(state: dict) -> dict:
     }
 
 
-def serialize_public(state: dict) -> dict:
-    res = {
-        "runId": state["runId"],
-        "status": state["status"],
-        "diagnosis": state.get("diagnosis", {}),
-        "chosenEffect": state.get("chosenEffect", ""),
-        "suppressed": state.get("suppressed", []),
-        "actionLog": state.get("actionLog", []),
-        "receiptLog": state.get("receiptLog", []),
-        "otlp": otlp(state)
-    }
-    if state["status"] == "waiting":
-        res["dispatches"] = state.get("dispatches", [])
-        res["approvals"] = state.get("approvals", [])
+def format_response(state: dict) -> dict:
+    status = state.get("status", "waiting")
+    if status == "waiting":
+        # Section 2 & 3: Waiting shape (NO otlp, NO actionLog, NO receiptLog)
+        return {
+            "runId": state["runId"],
+            "status": "waiting",
+            "diagnosis": state.get("diagnosis", {}),
+            "dispatches": state.get("dispatches", []),
+            "approvals": state.get("approvals", [])
+        }
     else:
-        res["dispatches"] = []
-        res["approvals"] = []
-    return res
+        # Section 4: Final completed / failed shape
+        return {
+            "runId": state["runId"],
+            "status": status,
+            "diagnosis": state.get("diagnosis", {}),
+            "chosenEffect": state.get("chosenEffect", ""),
+            "suppressed": state.get("suppressed", []),
+            "actionLog": state.get("actionLog", []),
+            "receiptLog": state.get("receiptLog", []),
+            "otlp": otlp(state),
+            "dispatches": [],
+            "approvals": []
+        }
 
 
-def load(run_id: str):
+def load_state(run_id: str):
     with db() as c:
         row = c.execute("SELECT state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if row:
@@ -141,11 +149,11 @@ def load(run_id: str):
     return None
 
 
-def save_state(state: dict, current_response: dict):
+def save_state(state: dict, current_resp: dict):
     with db() as c:
-        c.execute("UPDATE runs SET state_json=?, last_response=? WHERE run_id=?",
+        c.execute("UPDATE runs SET state_json=?, current_response=? WHERE run_id=?",
                   (json.dumps(state, separators=(",", ":")),
-                   json.dumps(current_response, separators=(",", ":")),
+                   json.dumps(current_resp, separators=(",", ":")),
                    state["runId"]))
 
 
@@ -158,7 +166,7 @@ def evidence_map(transcript: str) -> Dict[str, str]:
     return found
 
 
-def extract_args(schema: dict, incident: dict) -> dict:
+def extract_tool_args(schema: dict, incident: dict, transcript: str) -> dict:
     args = {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
@@ -210,8 +218,9 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         {"gen_ai.operation.name": "chat", "gen_ai.request.model": LLM_MODEL},
     )
 
+    # 1. Deterministic Semantic Analysis
     t_lower = transcript.lower()
-    best_cause = allowed[0] if allowed else "database_connection_exhaustion"
+    best_cause = allowed[0] if allowed else "unknown"
     best_score = -1
 
     for cause in allowed:
@@ -221,7 +230,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
             best_score = score
             best_cause = cause
 
-    # 2 to 4 evidence IDs
+    # Identify 2 to 4 bracketed evidence IDs supporting this cause
     ev_matches = []
     tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
     for lid, txt in ev_dict.items():
@@ -233,18 +242,18 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         ev_matches = (ev_matches + list(ev_dict.keys()))[:2]
     evidence_ids = ev_matches[:3]
 
-    # Diagnostics
-    chosen_diag = diag_catalog[:min(2, max_diag)]
+    # Minimal diagnostic tools: 1 tool by default (or up to 2 if parallel join needed)
+    chosen_diag = diag_catalog[:1] if diag_catalog else []
     diagnostics = []
     for t in chosen_diag:
-        targs = extract_args(t.get("inputSchema", {}), inc)
+        targs = extract_tool_args(t.get("inputSchema", {}), inc, transcript)
         diagnostics.append({
             "toolName": t["name"],
             "arguments": targs,
             "evidence": [evidence_ids[0]]
         })
 
-    # Rule: When a service is already at its permitted scaling limit, page the owner instead of scaling
+    # Scaling limit policy rule: "When a service is already at its permitted scaling limit, page the owner instead of scaling."
     is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
     if is_at_scale_limit and "page_oncall" in effect_tools:
         effect_tool = "page_oncall"
@@ -254,7 +263,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         effect_tool = list(effect_tools)[0] if effect_tools else "scale_service"
 
     eff_spec = next((t for t in catalog if t["name"] == effect_tool), None)
-    eff_args = extract_args(eff_spec.get("inputSchema", {}), inc) if eff_spec else {"service": inc.get("service", "core")}
+    eff_args = extract_tool_args(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
 
     plan = {
         "rootCause": best_cause,
@@ -264,16 +273,16 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         "effectArguments": eff_args
     }
 
-    # Low-cost planning refine if API is configured
+    # 2. Refine via Gemini (10s timeout safe window)
     if LLM_API_KEY:
         try:
             prompt = (
                 f"Incident: {inc.get('title')}. Allowed Root Causes: {json.dumps(allowed)}.\n"
-                f"Transcript snippet:\n{transcript[:4000]}\n\n"
-                f"Choose 1 root cause from Allowed Root Causes and 2-4 evidence IDs present in brackets. Return JSON: "
-                f'{{"rootCause":"...", "evidence":["ev_...","ev_..."]}}'
+                f"Transcript evidence lines:\n{transcript[:5000]}\n\n"
+                f"Select: 1 root cause from Allowed Root Causes and 2-4 exact bracketed IDs (e.g. ev_...). "
+                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"ev_1\",\"ev_2\"]}}"
             )
-            async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=2.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
                 r = await client.post(
                     f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
                     headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
@@ -295,8 +304,8 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
                         plan["evidence"] = v_ev[:4]
                         if plan["diagnostics"]:
                             plan["diagnostics"][0]["evidence"] = [plan["evidence"][0]]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Refine skipped: {e}", flush=True)
 
     return plan, model_span
 
@@ -389,11 +398,11 @@ async def create_incident(request: Request, req: dict = Body(...)):
 
     # Exact replay check & 409 conflict detection
     with db() as c:
-        row = c.execute("SELECT request_hash, last_response FROM runs WHERE run_id=?", (rid,)).fetchone()
+        row = c.execute("SELECT request_hash, initial_response FROM runs WHERE run_id=?", (rid,)).fetchone()
         if row:
             if row["request_hash"] != req_hash:
                 raise HTTPException(409, "runId content conflict")
-            return JSONResponse(json.loads(row["last_response"]))
+            return JSONResponse(json.loads(row["initial_response"]))
 
     trace_id, incoming_parent, tracestate = trace_context(request)
     server_id = hx(8)
@@ -416,7 +425,6 @@ async def create_incident(request: Request, req: dict = Body(...)):
         "_req": {k: v for k, v in req.items() if k != "sensitive"},
         "pending": {},
         "plan": None,
-        "_receiptHashes": {},
     }
 
     server = span(trace_id, server_id, incoming_parent, "POST /v2/incidents", 2, rid, state["publicMarker"])
@@ -435,18 +443,20 @@ async def create_incident(request: Request, req: dict = Body(...)):
             state, item["toolName"], item["arguments"], "diagnostic", item["evidence"]
         ))
 
-    # incident.join span connects independent diagnostics
+    # incident.join span connects independent diagnostics when > 1
     if len(state["dispatches"]) > 1:
         links = [{"traceId": trace_id, "spanId": state["pending"][d["actionId"]]["logicalSpanId"]}
                  for d in state["dispatches"]]
         state["_spans"].append(span(trace_id, hx(8), agent_id, "incident.join", 1, rid, state["publicMarker"], links=links))
 
-    initial_response = serialize_public(state)
+    initial_resp = format_response(state)
     with db() as c:
-        c.execute("INSERT INTO runs(run_id, request_hash, state_json, last_response) VALUES(?,?,?,?)",
-                  (rid, req_hash, json.dumps(state, separators=(",", ":")), json.dumps(initial_response, separators=(",", ":"))))
+        c.execute("INSERT INTO runs(run_id, request_hash, state_json, initial_response, current_response) VALUES(?,?,?,?,?)",
+                  (rid, req_hash, json.dumps(state, separators=(",", ":")),
+                   json.dumps(initial_resp, separators=(",", ":")),
+                   json.dumps(initial_resp, separators=(",", ":"))))
 
-    return JSONResponse(initial_response)
+    return JSONResponse(initial_resp)
 
 
 def maybe_advance(state: dict):
@@ -492,7 +502,10 @@ def maybe_advance(state: dict):
             state["_spans"].append(span(
                 state["_traceId"], hx(8), state["_agentSpanId"], "approval_gate", 1,
                 state["runId"], state["publicMarker"],
-                {"ga5.approval.id": approval["approvalId"]}
+                {
+                    "ga5.approval.id": approval["approvalId"],
+                    "ga5.approval.nonce": ""
+                }
             ))
             state["_effectStarted"] = True
             return
@@ -515,7 +528,7 @@ async def receipt(run_id: str, body: dict = Body(...)):
     if not isinstance(body, dict):
         raise HTTPException(400, "Expected JSON object")
 
-    state = load(run_id)
+    state = load_state(run_id)
     if not state:
         raise HTTPException(404, "Unknown runId")
 
@@ -525,11 +538,11 @@ async def receipt(run_id: str, body: dict = Body(...)):
 
     body_hash = sha(body)
     with db() as c:
-        previous = c.execute("SELECT run_id, content_hash FROM receipts WHERE receipt_id=?", (receipt_id,)).fetchone()
+        previous = c.execute("SELECT run_id, content_hash, response_json FROM receipts WHERE receipt_id=?", (receipt_id,)).fetchone()
     if previous:
         if previous["run_id"] != run_id or previous["content_hash"] != body_hash:
             raise HTTPException(409, "receiptId content conflict")
-        return JSONResponse(serialize_public(state))
+        return JSONResponse(json.loads(previous["response_json"]))
 
     if state["status"] != "waiting":
         raise HTTPException(422, "No pending work")
@@ -593,11 +606,6 @@ async def receipt(run_id: str, body: dict = Body(...)):
                     (pending["phase"] != "diagnostic" or outcome.get("resultClass") == "diagnosis_confirmed")
                 )
 
-        state["_receiptHashes"][receipt_id] = body_hash
-        with db() as c:
-            c.execute("INSERT INTO receipts(receipt_id, run_id, content_hash, body_json) VALUES(?,?,?,?)",
-                      (receipt_id, run_id, body_hash, json.dumps(body)))
-
         state["dispatches"] = [p["dispatch"] for p in state["pending"].values() if p["awaiting"]]
         maybe_advance(state)
 
@@ -633,20 +641,21 @@ async def receipt(run_id: str, body: dict = Body(...)):
             approval={"approvalId": approval["approvalId"], "nonce": nonce},
         )]
         state["approvals"] = []
-        state["_receiptHashes"][receipt_id] = body_hash
-        with db() as c:
-            c.execute("INSERT INTO receipts(receipt_id, run_id, content_hash, body_json) VALUES(?,?,?,?)",
-                      (receipt_id, run_id, body_hash, json.dumps(body)))
 
-    current_resp = serialize_public(state)
+    current_resp = format_response(state)
     save_state(state, current_resp)
+
+    with db() as c:
+        c.execute("INSERT INTO receipts(receipt_id, run_id, content_hash, response_json) VALUES(?,?,?,?)",
+                  (receipt_id, run_id, body_hash, json.dumps(current_resp, separators=(",", ":"))))
+
     return JSONResponse(current_resp)
 
 
 @app.get("/v2/incidents/{run_id}")
 async def get_incident(run_id: str):
     with db() as c:
-        row = c.execute("SELECT last_response FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        row = c.execute("SELECT current_response FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Unknown runId")
-    return JSONResponse(json.loads(row["last_response"]))
+    return JSONResponse(json.loads(row["current_response"]))
