@@ -12,12 +12,12 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_agent_v2.db")
+DB_PATH = os.getenv("DB_PATH", "incident_v3.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.0.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.1.0")
 
 
 def db():
@@ -31,7 +31,8 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS runs(
             run_id TEXT PRIMARY KEY,
             request_hash TEXT NOT NULL,
-            state_json TEXT NOT NULL
+            state_json TEXT NOT NULL,
+            public_response TEXT NOT NULL
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS receipts(
             receipt_id TEXT PRIMARY KEY,
@@ -126,18 +127,19 @@ def public(state: dict) -> dict:
 
 def load(run_id: str):
     with db() as c:
-        row = c.execute("SELECT request_hash, state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        row = c.execute("SELECT state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if row:
-        data = json.loads(row["state_json"])
-        data["_storedHash"] = row["request_hash"]
-        return data
+        return json.loads(row["state_json"])
     return None
 
 
 def save(state: dict):
+    pub = public(state)
     with db() as c:
-        c.execute("UPDATE runs SET state_json=? WHERE run_id=?",
-                  (json.dumps(state, separators=(",", ":")), state["runId"]))
+        c.execute("UPDATE runs SET state_json=?, public_response=? WHERE run_id=?",
+                  (json.dumps(state, separators=(",", ":")),
+                   json.dumps(pub, separators=(",", ":")),
+                   state["runId"]))
 
 
 def evidence_map(transcript: str) -> Dict[str, str]:
@@ -149,7 +151,7 @@ def evidence_map(transcript: str) -> Dict[str, str]:
     return found
 
 
-def extract_args_from_transcript(schema: dict, incident: dict, transcript: str) -> dict:
+def extract_args(schema: dict, incident: dict) -> dict:
     args = {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
@@ -201,70 +203,73 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         {"gen_ai.operation.name": "chat", "gen_ai.request.model": LLM_MODEL},
     )
 
-    # 1. Deterministic Semantic Analysis (Super Fast & Accurate)
-    matched_cause = allowed[0] if allowed else "database_connection_exhaustion"
-    best_score = -1
+    # Heuristic scoring of allowed causes against transcript
     t_lower = transcript.lower()
+    best_cause = allowed[0] if allowed else "database_connection_exhaustion"
+    best_score = -1
 
     for cause in allowed:
         tokens = [w for w in re.split(r"[_ -]+", cause.lower()) if len(w) > 3]
         score = sum(t_lower.count(tok) for tok in tokens)
         if score > best_score:
             best_score = score
-            matched_cause = cause
+            best_cause = cause
 
-    # Find 2 to 4 bracketed lines that mention symptoms or cause keywords
-    ev_candidates = []
-    cause_tokens = [w for w in re.split(r"[_ -]+", matched_cause.lower()) if len(w) > 3]
-    for lid, text in ev_dict.items():
-        txt_l = text.lower()
-        if any(tok in txt_l for tok in cause_tokens) or any(w in txt_l for w in ["error", "latency", "limit", "exhaust", "failure", "timeout", "high"]):
-            ev_candidates.append(lid)
+    # 2 to 4 bracketed evidence IDs
+    ev_matches = []
+    tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
+    for lid, txt in ev_dict.items():
+        tl = txt.lower()
+        if any(tok in tl for tok in tokens) or any(w in tl for w in ["error", "failure", "timeout", "spike", "exhaust", "high", "drop"]):
+            ev_matches.append(lid)
 
-    if len(ev_candidates) < 2:
-        ev_candidates = (ev_candidates + list(ev_dict.keys()))[:2]
-    selected_evidence = ev_candidates[:3]
+    if len(ev_matches) < 2:
+        ev_matches = (ev_matches + list(ev_dict.keys()))[:2]
+    evidence_ids = ev_matches[:3]
 
-    # Diagnostic tools (choose 1 to max_diag from non-effect tools)
+    # Diagnostics
+    chosen_diag = diag_catalog[:min(2, max_diag)]
     diagnostics = []
-    for t in diag_catalog[:min(2, max_diag)]:
-        tname = t["name"]
-        targs = extract_args_from_transcript(t.get("inputSchema", {}), inc, transcript)
+    for t in chosen_diag:
+        targs = extract_args(t.get("inputSchema", {}), inc)
         diagnostics.append({
-            "toolName": tname,
+            "toolName": t["name"],
             "arguments": targs,
-            "evidence": [selected_evidence[0]]
+            "evidence": [evidence_ids[0]]
         })
 
-    # Scaling Limit Rule Check
-    # Rule: "When a service is already at its permitted scaling limit, page the owner instead of scaling."
-    is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
-    
+    # Rule: If at scaling limit, page oncall/owner instead of scaling
+    is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum"])
     if is_at_scale_limit and "page_oncall" in effect_tools:
-        chosen_effect = "page_oncall"
+        effect_tool = "page_oncall"
     elif is_at_scale_limit and "page_owner" in effect_tools:
-        chosen_effect = "page_owner"
+        effect_tool = "page_owner"
     else:
-        chosen_effect = list(effect_tools)[0] if effect_tools else "scale_service"
+        effect_tool = list(effect_tools)[0] if effect_tools else "scale_service"
 
-    eff_spec = next((t for t in catalog if t["name"] == chosen_effect), None)
-    eff_args = extract_args_from_transcript(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
+    eff_spec = next((t for t in catalog if t["name"] == effect_tool), None)
+    eff_args = extract_args(eff_spec.get("inputSchema", {}), inc) if eff_spec else {"service": inc.get("service", "core")}
 
     plan = {
-        "rootCause": matched_cause,
-        "evidence": selected_evidence,
+        "rootCause": best_cause,
+        "evidence": evidence_ids,
         "diagnostics": diagnostics,
-        "effectTool": chosen_effect,
+        "effectTool": effect_tool,
         "effectArguments": eff_args
     }
 
-    # Optional fast LLM refine if available
-    if LLM_API_KEY and len(transcript) < 40000:
+    # Direct Gemini / LLM call if credentials available
+    if LLM_API_KEY:
         try:
-            prompt = f"Identify root cause from: {json.dumps(allowed)}. Evidence from transcript: {transcript[:4000]}. Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"ev_1\",\"ev_2\"]}}"
+            prompt = (
+                f"Incident: {inc.get('title')}. Allowed Root Causes: {json.dumps(allowed)}.\n"
+                f"Transcript snippet:\n{transcript[:4000]}\n\n"
+                f"Choose 1 root cause from Allowed Root Causes and 2-4 evidence IDs present in brackets. Return JSON: "
+                f'{{"rootCause":"...", "evidence":["ev_...","ev_..."]}}'
+            )
             async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=2.0)) as client:
                 r = await client.post(
-                    LLM_BASE_URL.rstrip("/") + "/chat/completions",
+                    f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
                     headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
                     json={
                         "model": LLM_MODEL,
@@ -276,11 +281,14 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
                 if r.status_code == 200:
                     data = r.json()["choices"][0]["message"]["content"]
                     parsed = json.loads(data)
-                    if parsed.get("rootCause") in allowed:
-                        plan["rootCause"] = parsed["rootCause"]
-                    val_ev = [x for x in parsed.get("evidence", []) if x in ev_dict]
-                    if len(val_ev) >= 2:
-                        plan["evidence"] = val_ev[:4]
+                    rc = parsed.get("rootCause")
+                    if rc in allowed:
+                        plan["rootCause"] = rc
+                    v_ev = [x for x in parsed.get("evidence", []) if x in ev_dict]
+                    if len(v_ev) >= 2:
+                        plan["evidence"] = v_ev[:4]
+                        if plan["diagnostics"]:
+                            plan["diagnostics"][0]["evidence"] = [plan["evidence"][0]]
         except Exception:
             pass
 
@@ -371,15 +379,15 @@ async def create_incident(request: Request, req: dict = Body(...)):
             raise HTTPException(422, f"Missing {key}")
 
     rid = str(req["runId"])
-    # Canonical hash for exact replay & conflict detection
     req_hash = sha({k: v for k, v in req.items() if k != "sensitive"})
 
+    # Exact replay check & changed-content 409 conflict
     with db() as c:
-        row = c.execute("SELECT request_hash, state_json FROM runs WHERE run_id=?", (rid,)).fetchone()
+        row = c.execute("SELECT request_hash, public_response FROM runs WHERE run_id=?", (rid,)).fetchone()
         if row:
             if row["request_hash"] != req_hash:
                 raise HTTPException(409, "runId content conflict")
-            return JSONResponse(public(json.loads(row["state_json"])))
+            return JSONResponse(json.loads(row["public_response"]))
 
     trace_id, incoming_parent, tracestate = trace_context(request)
     server_id = hx(8)
@@ -421,15 +429,18 @@ async def create_incident(request: Request, req: dict = Body(...)):
             state, item["toolName"], item["arguments"], "diagnostic", item["evidence"]
         ))
 
+    # incident.join span when diagnostics fan out
     if len(state["dispatches"]) > 1:
         links = [{"traceId": trace_id, "spanId": state["pending"][d["actionId"]]["logicalSpanId"]}
                  for d in state["dispatches"]]
         state["_spans"].append(span(trace_id, hx(8), agent_id, "incident.join", 1, rid, state["publicMarker"], links=links))
 
+    pub_response = public(state)
     with db() as c:
-        c.execute("INSERT INTO runs(run_id, request_hash, state_json) VALUES(?,?,?)",
-                  (rid, req_hash, json.dumps(state, separators=(",", ":"))))
-    return JSONResponse(public(state))
+        c.execute("INSERT INTO runs(run_id, request_hash, state_json, public_response) VALUES(?,?,?,?)",
+                  (rid, req_hash, json.dumps(state, separators=(",", ":")), json.dumps(pub_response, separators=(",", ":"))))
+
+    return JSONResponse(pub_response)
 
 
 def maybe_advance(state: dict):
