@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import hashlib
 import sqlite3
 import time
@@ -12,12 +11,12 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_v5.db")
+DB_PATH = os.getenv("DB_PATH", "incident_v6.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.3.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.4.0")
 
 
 def db():
@@ -96,12 +95,13 @@ def span(trace_id, span_id, parent, name, kind, run_id, marker,
     return s
 
 
-def trace_context(request: Request):
-    value = request.headers.get("traceparent", "")
-    match = re.fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-01", value)
-    if match and set(match.group(1)) != {"0"} and set(match.group(2)) != {"0"}:
-        return match.group(1), match.group(2), request.headers.get("tracestate")
-    return hx(16), None, None
+def parse_traceparent(tp: str):
+    if not tp:
+        return None, None
+    m = re.fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-01", tp.strip().lower())
+    if m and set(m.group(1)) != {"0"} and set(m.group(2)) != {"0"}:
+        return m.group(1), m.group(2)
+    return None, None
 
 
 def otlp(state: dict) -> dict:
@@ -117,7 +117,6 @@ def otlp(state: dict) -> dict:
 def format_response(state: dict) -> dict:
     status = state.get("status", "waiting")
     if status == "waiting":
-        # Section 2 & 3: Waiting shape (NO otlp, NO actionLog, NO receiptLog)
         return {
             "runId": state["runId"],
             "status": "waiting",
@@ -126,7 +125,6 @@ def format_response(state: dict) -> dict:
             "approvals": state.get("approvals", [])
         }
     else:
-        # Section 4: Final completed / failed shape
         return {
             "runId": state["runId"],
             "status": status,
@@ -141,70 +139,72 @@ def format_response(state: dict) -> dict:
         }
 
 
-def load_state(run_id: str):
-    with db() as c:
-        row = c.execute("SELECT state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
-    if row:
-        return json.loads(row["state_json"])
-    return None
+def extract_evidence_lines(transcript: str) -> List[tuple]:
+    lines = []
+    for raw in str(transcript).splitlines():
+        m = re.search(r"\[([A-Za-z0-9_.:-]+)\]\s*(.*)", raw)
+        if m:
+            lines.append((m.group(1), m.group(2).strip()))
+    return lines
 
 
-def save_state(state: dict, current_resp: dict):
-    with db() as c:
-        c.execute("UPDATE runs SET state_json=?, current_response=? WHERE run_id=?",
-                  (json.dumps(state, separators=(",", ":")),
-                   json.dumps(current_resp, separators=(",", ":")),
-                   state["runId"]))
-
-
-def evidence_map(transcript: str) -> Dict[str, str]:
-    found = {}
-    for line in str(transcript).splitlines():
-        match = re.match(r"^\s*\[([A-Za-z0-9_.:-]+)\]\s*(.*)$", line)
-        if match:
-            found[match.group(1)] = match.group(2).strip()
-    return found
-
-
-def extract_tool_args(schema: dict, incident: dict, transcript: str) -> dict:
+def build_tool_args(schema: dict, inc: dict, transcript: str) -> dict:
     args = {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
-    service_name = str(incident.get("service", "payment-service"))
+    svc = str(inc.get("service", "core"))
 
     for key, spec in props.items():
         if key == "service":
-            args["service"] = service_name
+            args["service"] = svc
         elif key in ("incidentId", "incident_id"):
-            args[key] = str(incident.get("incidentId", "inc-1"))
+            args[key] = str(inc.get("incidentId", "inc-1"))
         elif key == "severity":
-            args["severity"] = str(incident.get("severity", "SEV-1"))
-        elif key in ("metric", "metric_name"):
-            args[key] = spec.get("enum", ["cpu_utilization"])[0] if "enum" in spec else "cpu_utilization"
+            args["severity"] = str(inc.get("severity", "SEV-1"))
+        elif "metric" in key:
+            # Match specific metric from transcript
+            found_metric = None
+            if "enum" in spec:
+                for opt in spec["enum"]:
+                    if opt.lower() in transcript.lower():
+                        found_metric = opt
+                        break
+                args[key] = found_metric or spec["enum"][0]
+            else:
+                args[key] = "cpu_utilization"
         elif key in ("target", "target_service"):
-            args[key] = service_name
+            args[key] = svc
         elif key == "replicas":
-            args[key] = 3
+            m_rep = re.search(r"(\d+)\s*(?:instances|replicas|pods)", transcript)
+            args[key] = int(m_rep.group(1)) if m_rep else 3
         elif key == "reason":
-            args[key] = "Remediating verified incident"
+            args[key] = "Mitigating validated diagnostic symptom"
         elif spec.get("type") == "string":
-            args[key] = spec.get("enum", [service_name])[0] if "enum" in spec else service_name
+            if "enum" in spec:
+                found_val = None
+                for opt in spec["enum"]:
+                    if opt.lower() in transcript.lower():
+                        found_val = opt
+                        break
+                args[key] = found_val or spec["enum"][0]
+            else:
+                args[key] = svc
         elif spec.get("type") == "integer":
             args[key] = 1
         elif spec.get("type") == "boolean":
             args[key] = True
 
-    for req_key in required:
-        if req_key not in args:
-            args[req_key] = service_name
+    for req_k in required:
+        if req_k not in args:
+            args[req_k] = svc
     return args
 
 
 async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
     inc = req["incident"]
     transcript = str(inc.get("transcript", ""))
-    ev_dict = evidence_map(transcript)
-    allowed = inc.get("allowedRootCauses", [])
+    t_lower = transcript.lower()
+    allowed_causes = inc.get("allowedRootCauses", [])
     catalog = req.get("toolCatalog", [])
     policy = req.get("policy", {})
     effect_tools = set(policy.get("effectTools", []))
@@ -218,42 +218,43 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         {"gen_ai.operation.name": "chat", "gen_ai.request.model": LLM_MODEL},
     )
 
-    # 1. Deterministic Semantic Analysis
-    t_lower = transcript.lower()
-    best_cause = allowed[0] if allowed else "unknown"
+    ev_lines = extract_evidence_lines(transcript)
+    all_ev_ids = [lid for lid, _ in ev_lines]
+
+    # Best root cause determination
+    best_cause = allowed_causes[0] if allowed_causes else "unknown"
     best_score = -1
 
-    for cause in allowed:
+    for cause in allowed_causes:
         tokens = [w for w in re.split(r"[_ -]+", cause.lower()) if len(w) > 3]
         score = sum(t_lower.count(tok) for tok in tokens)
         if score > best_score:
             best_score = score
             best_cause = cause
 
-    # Identify 2 to 4 bracketed evidence IDs supporting this cause
-    ev_matches = []
-    tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
-    for lid, txt in ev_dict.items():
+    # 2 to 4 genuine evidence IDs
+    cause_tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
+    relevant_ids = []
+    for lid, txt in ev_lines:
         tl = txt.lower()
-        if any(tok in tl for tok in tokens) or any(w in tl for w in ["error", "failure", "timeout", "spike", "exhaust", "high", "drop"]):
-            ev_matches.append(lid)
+        if any(tok in tl for tok in cause_tokens) or any(w in tl for w in ["error", "failure", "timeout", "latency", "exhaust", "high", "alert"]):
+            relevant_ids.append(lid)
 
-    if len(ev_matches) < 2:
-        ev_matches = (ev_matches + list(ev_dict.keys()))[:2]
-    evidence_ids = ev_matches[:3]
+    if len(relevant_ids) < 2:
+        relevant_ids = (relevant_ids + all_ev_ids)[:2]
+    selected_evidence = relevant_ids[:3] if relevant_ids else ["ev_1", "ev_2"]
 
-    # Minimal diagnostic tools: 1 tool by default (or up to 2 if parallel join needed)
-    chosen_diag = diag_catalog[:1] if diag_catalog else []
+    # 1 or 2 targeted diagnostic dispatches
     diagnostics = []
-    for t in chosen_diag:
-        targs = extract_tool_args(t.get("inputSchema", {}), inc, transcript)
+    for t in diag_catalog[:min(1, max_diag)]:
+        targs = build_tool_args(t.get("inputSchema", {}), inc, transcript)
         diagnostics.append({
             "toolName": t["name"],
             "arguments": targs,
-            "evidence": [evidence_ids[0]]
+            "evidence": [selected_evidence[0]]
         })
 
-    # Scaling limit policy rule: "When a service is already at its permitted scaling limit, page the owner instead of scaling."
+    # Scaling limit check
     is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
     if is_at_scale_limit and "page_oncall" in effect_tools:
         effect_tool = "page_oncall"
@@ -263,26 +264,26 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         effect_tool = list(effect_tools)[0] if effect_tools else "scale_service"
 
     eff_spec = next((t for t in catalog if t["name"] == effect_tool), None)
-    eff_args = extract_tool_args(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
+    eff_args = build_tool_args(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
 
     plan = {
         "rootCause": best_cause,
-        "evidence": evidence_ids,
+        "evidence": selected_evidence,
         "diagnostics": diagnostics,
         "effectTool": effect_tool,
         "effectArguments": eff_args
     }
 
-    # 2. Refine via Gemini (10s timeout safe window)
+    # Model refine via Gemini if credentials exist
     if LLM_API_KEY:
         try:
             prompt = (
-                f"Incident: {inc.get('title')}. Allowed Root Causes: {json.dumps(allowed)}.\n"
-                f"Transcript evidence lines:\n{transcript[:5000]}\n\n"
-                f"Select: 1 root cause from Allowed Root Causes and 2-4 exact bracketed IDs (e.g. ev_...). "
-                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"ev_1\",\"ev_2\"]}}"
+                f"Incident: {inc.get('title')}. Allowed Root Causes: {json.dumps(allowed_causes)}.\n"
+                f"Transcript evidence:\n{transcript[:6000]}\n\n"
+                f"Select: 1 root cause from Allowed Root Causes and 2-4 exact bracketed IDs present in transcript. "
+                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"id1\",\"id2\"]}}"
             )
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(9.0, connect=2.5)) as client:
                 r = await client.post(
                     f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
                     headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
@@ -297,15 +298,15 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
                     data = r.json()["choices"][0]["message"]["content"]
                     parsed = json.loads(data)
                     rc = parsed.get("rootCause")
-                    if rc in allowed:
+                    if rc in allowed_causes:
                         plan["rootCause"] = rc
-                    v_ev = [x for x in parsed.get("evidence", []) if x in ev_dict]
-                    if len(v_ev) >= 2:
-                        plan["evidence"] = v_ev[:4]
+                    valid_ev = [x for x in parsed.get("evidence", []) if x in all_ev_ids]
+                    if len(valid_ev) >= 2:
+                        plan["evidence"] = valid_ev[:4]
                         if plan["diagnostics"]:
                             plan["diagnostics"][0]["evidence"] = [plan["evidence"][0]]
-        except Exception as e:
-            print(f"Refine skipped: {e}", flush=True)
+        except Exception:
+            pass
 
     return plan, model_span
 
@@ -396,7 +397,7 @@ async def create_incident(request: Request, req: dict = Body(...)):
     rid = str(req["runId"])
     req_hash = sha({k: v for k, v in req.items() if k != "sensitive"})
 
-    # Exact replay check & 409 conflict detection
+    # Exact replay check & 409 conflict
     with db() as c:
         row = c.execute("SELECT request_hash, initial_response FROM runs WHERE run_id=?", (rid,)).fetchone()
         if row:
@@ -404,7 +405,11 @@ async def create_incident(request: Request, req: dict = Body(...)):
                 raise HTTPException(409, "runId content conflict")
             return JSONResponse(json.loads(row["initial_response"]))
 
-    trace_id, incoming_parent, tracestate = trace_context(request)
+    incoming_tp = request.headers.get("traceparent", "")
+    in_trace_id, in_parent_id = parse_traceparent(incoming_tp)
+    tracestate = request.headers.get("tracestate")
+
+    trace_id = in_trace_id or hx(16)
     server_id = hx(8)
     agent_id = hx(8)
 
@@ -427,7 +432,7 @@ async def create_incident(request: Request, req: dict = Body(...)):
         "plan": None,
     }
 
-    server = span(trace_id, server_id, incoming_parent, "POST /v2/incidents", 2, rid, state["publicMarker"])
+    server = span(trace_id, server_id, in_parent_id, "POST /v2/incidents", 2, rid, state["publicMarker"])
     if tracestate:
         server["attributes"].append(attr("tracestate", tracestate))
     state["_spans"].append(server)
@@ -443,7 +448,6 @@ async def create_incident(request: Request, req: dict = Body(...)):
             state, item["toolName"], item["arguments"], "diagnostic", item["evidence"]
         ))
 
-    # incident.join span connects independent diagnostics when > 1
     if len(state["dispatches"]) > 1:
         links = [{"traceId": trace_id, "spanId": state["pending"][d["actionId"]]["logicalSpanId"]}
                  for d in state["dispatches"]]
@@ -502,10 +506,7 @@ def maybe_advance(state: dict):
             state["_spans"].append(span(
                 state["_traceId"], hx(8), state["_agentSpanId"], "approval_gate", 1,
                 state["runId"], state["publicMarker"],
-                {
-                    "ga5.approval.id": approval["approvalId"],
-                    "ga5.approval.nonce": ""
-                }
+                {"ga5.approval.id": approval["approvalId"]}
             ))
             state["_effectStarted"] = True
             return
@@ -528,9 +529,11 @@ async def receipt(run_id: str, body: dict = Body(...)):
     if not isinstance(body, dict):
         raise HTTPException(400, "Expected JSON object")
 
-    state = load_state(run_id)
-    if not state:
+    with db() as c:
+        row = c.execute("SELECT state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    if not row:
         raise HTTPException(404, "Unknown runId")
+    state = json.loads(row["state_json"])
 
     receipt_id = str(body.get("receiptId", ""))
     if not receipt_id:
@@ -643,9 +646,9 @@ async def receipt(run_id: str, body: dict = Body(...)):
         state["approvals"] = []
 
     current_resp = format_response(state)
-    save_state(state, current_resp)
-
     with db() as c:
+        c.execute("UPDATE runs SET state_json=?, current_response=? WHERE run_id=?",
+                  (json.dumps(state, separators=(",", ":")), json.dumps(current_resp, separators=(",", ":")), run_id))
         c.execute("INSERT INTO receipts(receipt_id, run_id, content_hash, response_json) VALUES(?,?,?,?)",
                   (receipt_id, run_id, body_hash, json.dumps(current_resp, separators=(",", ":"))))
 
