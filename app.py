@@ -11,12 +11,12 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_v7.db")
+DB_PATH = os.getenv("DB_PATH", "incident_v8.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.5.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.6.0")
 
 
 def db():
@@ -53,8 +53,12 @@ def sha(obj: Any) -> str:
     return hashlib.sha256(canon(obj).encode("utf-8")).hexdigest()
 
 
-def hx(n: int) -> str:
-    return secrets.token_hex(n)
+def hx_span() -> str:
+    return secrets.token_hex(8)  # 16 lowercase hex characters
+
+
+def hx_trace() -> str:
+    return secrets.token_hex(16)  # 32 lowercase hex characters
 
 
 def attr(k: str, v: Any) -> dict:
@@ -148,15 +152,16 @@ def extract_evidence_lines(transcript: str) -> List[tuple]:
     return lines
 
 
-def build_fallback_args(schema: dict, inc: dict, transcript: str) -> dict:
+def build_tool_arguments(schema: dict, inc: dict, transcript: str) -> dict:
     args = {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
-    svc = str(inc.get("service", "payment-service"))
+    service_name = str(inc.get("service", "payment-service"))
 
     for key, spec in props.items():
+        stype = spec.get("type", "string")
         if key in ("service", "target_service", "target"):
-            args[key] = svc
+            args[key] = service_name
         elif key in ("incidentId", "incident_id"):
             args[key] = str(inc.get("incidentId", "inc-1"))
         elif key == "severity":
@@ -170,20 +175,20 @@ def build_fallback_args(schema: dict, inc: dict, transcript: str) -> dict:
             args[key] = int(m_rep.group(1)) if m_rep else 3
         elif key == "reason":
             args[key] = "Remediating verified incident"
-        elif spec.get("type") == "string":
+        elif stype == "string":
             if "enum" in spec:
                 matched = next((c for c in spec["enum"] if str(c).lower() in transcript.lower()), spec["enum"][0])
                 args[key] = matched
             else:
-                args[key] = svc
-        elif spec.get("type") == "integer":
+                args[key] = service_name
+        elif stype == "integer":
             args[key] = 1
-        elif spec.get("type") == "boolean":
+        elif stype == "boolean":
             args[key] = True
 
     for req_k in required:
         if req_k not in args:
-            args[req_k] = svc
+            args[req_k] = service_name
     return args
 
 
@@ -198,7 +203,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
     diag_catalog = [t for t in catalog if t["name"] not in effect_tools]
     max_diag = int(policy.get("maximumDiagnostics", 3))
 
-    model_id = hx(8)
+    model_id = hx_span()
     model_span = span(
         trace_id, model_id, agent_span_id, "chat incident-plan", 3,
         req["runId"], req["publicMarker"],
@@ -208,7 +213,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
     ev_lines = extract_evidence_lines(transcript)
     all_ev_ids = [lid for lid, _ in ev_lines]
 
-    # Deterministic base
+    # Best root cause determination
     best_cause = allowed_causes[0] if allowed_causes else "unknown"
     best_score = -1
     for cause in allowed_causes:
@@ -218,34 +223,43 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
             best_score = score
             best_cause = cause
 
-    # 2 to 4 valid line IDs
+    # 2 to 4 genuine bracketed IDs from transcript
     cause_tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
     relevant_ids = []
     for lid, txt in ev_lines:
         tl = txt.lower()
         if any(tok in tl for tok in cause_tokens) or any(w in tl for w in ["error", "failure", "timeout", "latency", "exhaust", "high", "alert"]):
             relevant_ids.append(lid)
+
     if len(relevant_ids) < 2:
         relevant_ids = (relevant_ids + all_ev_ids)[:2]
     selected_evidence = relevant_ids[:3] if relevant_ids else all_ev_ids[:2]
 
-    # Select best matching diagnostic tool based on transcript keywords
-    def rank_diag_tool(tool):
+    # Rank diagnostic tools
+    def rank_tool(tool):
         name = tool["name"].lower()
         score = 0
-        if "metric" in name and ("metric" in t_lower or "cpu" in t_lower or "utilization" in t_lower):
+        if "metric" in name and any(k in t_lower for k in ["metric", "cpu", "memory", "utilization"]):
             score += 5
-        if "log" in name and ("log" in t_lower or "error" in t_lower or "exception" in t_lower):
+        if "log" in name and any(k in t_lower for k in ["log", "error", "stack", "trace"]):
             score += 5
-        if "trace" in name and ("span" in t_lower or "latency" in t_lower):
+        if "trace" in name and any(k in t_lower for k in ["latency", "duration", "p99"]):
             score += 4
         if "health" in name or "status" in name:
             score += 2
         return score
 
-    sorted_diags = sorted(diag_catalog, key=rank_diag_tool, reverse=True)
-    chosen_tool = sorted_diags[0] if sorted_diags else catalog[0]
-    diag_args = build_fallback_args(chosen_tool.get("inputSchema", {}), inc, transcript)
+    sorted_diags = sorted(diag_catalog, key=rank_tool, reverse=True)
+    chosen_diag = sorted_diags[:min(1, max_diag)] if sorted_diags else catalog[:1]
+
+    diagnostics = []
+    for t in chosen_diag:
+        targs = build_tool_arguments(t.get("inputSchema", {}), inc, transcript)
+        diagnostics.append({
+            "toolName": t["name"],
+            "arguments": targs,
+            "evidence": [selected_evidence[0]]
+        })
 
     # Scaling limit check
     is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
@@ -257,32 +271,28 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         effect_tool = list(effect_tools)[0] if effect_tools else "scale_service"
 
     eff_spec = next((t for t in catalog if t["name"] == effect_tool), None)
-    eff_args = build_fallback_args(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
+    eff_args = build_tool_arguments(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
 
     plan = {
         "rootCause": best_cause,
         "evidence": selected_evidence,
-        "diagnostics": [{
-            "toolName": chosen_tool["name"],
-            "arguments": diag_args,
-            "evidence": [selected_evidence[0]]
-        }],
+        "diagnostics": diagnostics,
         "effectTool": effect_tool,
         "effectArguments": eff_args
     }
 
-    # Full LLM Planner with Tool Catalog and Arguments
+    # Model refine via Gemini if credentials exist
     if LLM_API_KEY:
         try:
             diag_specs = [{"name": t["name"], "schema": t.get("inputSchema", {})} for t in diag_catalog]
             prompt = (
-                f"Service: {inc.get('service')}, Title: {inc.get('title')}.\n"
-                f"Transcript snippet:\n{transcript[:5000]}\n\n"
+                f"Incident: {inc.get('title')} on service {inc.get('service')}.\n"
                 f"Allowed Root Causes: {json.dumps(allowed_causes)}\n"
-                f"Diagnostic Tool Catalog: {json.dumps(diag_specs)}\n"
-                f"Rule: Choose exactly 1 root cause from Allowed Root Causes, 2 to 4 bracketed evidence IDs from transcript, "
-                f"and 1 diagnostic tool from catalog with arguments derived from the transcript.\n"
-                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"ev_1\",\"ev_2\"], "
+                f"Diagnostic Tools: {json.dumps(diag_specs)}\n"
+                f"Transcript snippet:\n{transcript[:5000]}\n\n"
+                f"Select 1 root cause from Allowed Root Causes, 2 to 4 bracketed IDs from transcript, "
+                f"and 1 diagnostic tool with exact schema-valid arguments.\n"
+                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"id1\",\"id2\"], "
                 f"\"diagnosticTool\":\"<name>\", \"diagnosticArgs\":{{}}}}"
             )
             async with httpx.AsyncClient(timeout=httpx.Timeout(9.0, connect=2.5)) as client:
@@ -309,7 +319,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
                     tool_n = parsed.get("diagnosticTool")
                     matched_t = next((t for t in diag_catalog if t["name"] == tool_n), None)
                     if matched_t:
-                        t_args = parsed.get("diagnosticArgs") or build_fallback_args(matched_t.get("inputSchema", {}), inc, transcript)
+                        t_args = parsed.get("diagnosticArgs") or build_tool_arguments(matched_t.get("inputSchema", {}), inc, transcript)
                         plan["diagnostics"] = [{
                             "toolName": matched_t["name"],
                             "arguments": t_args,
@@ -322,7 +332,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
 
 
 def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
-    client_id = hx(8)
+    client_id = hx_span()
     logical_id = logical["logicalSpanId"]
     d = {
         "actionId": action_id,
@@ -331,7 +341,7 @@ def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
         "toolName": tool,
         "arguments": logical["arguments"],
         "evidence": logical["evidence"],
-        "attempt": attempt,
+        "attempt": int(attempt),
         "traceparent": f"00-{state['_traceId']}-{client_id}-01",
     }
     if logical.get("approval"):
@@ -339,7 +349,7 @@ def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
         d["approvalNonce"] = logical["approval"]["nonce"]
 
     logical["currentClientSpanId"] = client_id
-    logical["attempt"] = attempt
+    logical["attempt"] = int(attempt)
     logical["dispatch"] = d
     state.setdefault("actionLog", []).append(d)
 
@@ -348,9 +358,9 @@ def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
         state["runId"], state["publicMarker"],
         {
             "ga5.action.id": action_id,
-            "ga5.attempt": attempt,
+            "ga5.attempt": int(attempt),
             "http.request.method": "POST",
-            "http.request.resend_count": attempt - 1
+            "http.request.resend_count": int(attempt) - 1
         },
         status_code=0
     ))
@@ -358,9 +368,9 @@ def add_client_attempt(state, logical, attempt, action_id, tool, call_id):
 
 
 def dispatch(state, tool, args, phase, evidence, attempt=1, action_id=None, call_id=None, approval=None):
-    aid = action_id or f"act_{hx(6)}"
+    aid = action_id or f"act_{hx_span()}"
     cid = call_id or aid
-    logical_id = hx(8)
+    logical_id = hx_span()
     logical = {
         "actionId": aid,
         "callId": cid,
@@ -368,7 +378,7 @@ def dispatch(state, tool, args, phase, evidence, attempt=1, action_id=None, call
         "arguments": args,
         "phase": phase,
         "evidence": evidence,
-        "attempt": attempt,
+        "attempt": int(attempt),
         "awaiting": True,
         "succeeded": False,
         "logicalSpanId": logical_id,
@@ -419,9 +429,9 @@ async def create_incident(request: Request, req: dict = Body(...)):
     in_trace_id, in_parent_id = parse_traceparent(incoming_tp)
     tracestate = request.headers.get("tracestate")
 
-    trace_id = in_trace_id or hx(16)
-    server_id = hx(8)
-    agent_id = hx(8)
+    trace_id = in_trace_id or hx_trace()
+    server_id = hx_span()
+    agent_id = hx_span()
 
     state = {
         "runId": rid,
@@ -461,7 +471,7 @@ async def create_incident(request: Request, req: dict = Body(...)):
     if len(state["dispatches"]) > 1:
         links = [{"traceId": trace_id, "spanId": state["pending"][d["actionId"]]["logicalSpanId"]}
                  for d in state["dispatches"]]
-        state["_spans"].append(span(trace_id, hx(8), agent_id, "incident.join", 1, rid, state["publicMarker"], links=links))
+        state["_spans"].append(span(trace_id, hx_span(), agent_id, "incident.join", 1, rid, state["publicMarker"], links=links))
 
     initial_resp = format_response(state)
     with db() as c:
@@ -501,8 +511,8 @@ def maybe_advance(state: dict):
 
         policy = state["_req"].get("policy", {})
         if effect in policy.get("approvalRequiredFor", ["rollback_deployment", "disable_feature"]):
-            approval_id = f"appr_{hx(6)}"
-            action_id = f"act_{hx(6)}"
+            approval_id = f"appr_{hx_span()}"
+            action_id = f"act_{hx_span()}"
             approval = {
                 "approvalId": approval_id,
                 "actionId": action_id,
@@ -514,7 +524,7 @@ def maybe_advance(state: dict):
             state["status"] = "waiting"
             state["pendingApproval"] = {"approval": approval, "arguments": args}
             state["_spans"].append(span(
-                state["_traceId"], hx(8), state["_agentSpanId"], "approval_gate", 1,
+                state["_traceId"], hx_span(), state["_agentSpanId"], "approval_gate", 1,
                 state["runId"], state["publicMarker"],
                 {"ga5.approval.id": approval["approvalId"]}
             ))
@@ -583,8 +593,8 @@ async def receipt(run_id: str, body: dict = Body(...)):
                 "receiptId": receipt_id,
                 "actionId": aid,
                 "callId": pending["callId"],
-                "attempt": pending["attempt"],
-                "status": status,
+                "attempt": int(pending["attempt"]),
+                "status": int(status),
                 "resultClass": outcome.get("resultClass", ""),
                 "nonce": nonce,
                 **({"errorType": "timeout"} if status == 0 and outcome.get("errorType") == "timeout" else {})
@@ -595,7 +605,7 @@ async def receipt(run_id: str, body: dict = Body(...)):
                 client_span["attributes"].extend([
                     attr("ga5.receipt.id", receipt_id),
                     attr("ga5.receipt.nonce", nonce),
-                    attr("http.response.status_code", status),
+                    attr("http.response.status_code", int(status)),
                 ])
                 if status == 503:
                     client_span["status"] = {"code": 2}
