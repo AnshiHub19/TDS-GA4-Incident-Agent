@@ -11,12 +11,12 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_v6.db")
+DB_PATH = os.getenv("DB_PATH", "incident_v7.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.4.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.5.0")
 
 
 def db():
@@ -148,45 +148,32 @@ def extract_evidence_lines(transcript: str) -> List[tuple]:
     return lines
 
 
-def build_tool_args(schema: dict, inc: dict, transcript: str) -> dict:
+def build_fallback_args(schema: dict, inc: dict, transcript: str) -> dict:
     args = {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
-    svc = str(inc.get("service", "core"))
+    svc = str(inc.get("service", "payment-service"))
 
     for key, spec in props.items():
-        if key == "service":
-            args["service"] = svc
+        if key in ("service", "target_service", "target"):
+            args[key] = svc
         elif key in ("incidentId", "incident_id"):
             args[key] = str(inc.get("incidentId", "inc-1"))
         elif key == "severity":
-            args["severity"] = str(inc.get("severity", "SEV-1"))
+            args[key] = str(inc.get("severity", "SEV-1"))
         elif "metric" in key:
-            # Match specific metric from transcript
-            found_metric = None
-            if "enum" in spec:
-                for opt in spec["enum"]:
-                    if opt.lower() in transcript.lower():
-                        found_metric = opt
-                        break
-                args[key] = found_metric or spec["enum"][0]
-            else:
-                args[key] = "cpu_utilization"
-        elif key in ("target", "target_service"):
-            args[key] = svc
+            candidates = spec.get("enum", ["cpu_utilization", "latency_p99", "error_rate", "memory_usage"])
+            matched = next((c for c in candidates if c.lower() in transcript.lower()), candidates[0])
+            args[key] = matched
         elif key == "replicas":
-            m_rep = re.search(r"(\d+)\s*(?:instances|replicas|pods)", transcript)
+            m_rep = re.search(r"(\d+)\s*(?:replicas|instances|pods)", transcript)
             args[key] = int(m_rep.group(1)) if m_rep else 3
         elif key == "reason":
-            args[key] = "Mitigating validated diagnostic symptom"
+            args[key] = "Remediating verified incident"
         elif spec.get("type") == "string":
             if "enum" in spec:
-                found_val = None
-                for opt in spec["enum"]:
-                    if opt.lower() in transcript.lower():
-                        found_val = opt
-                        break
-                args[key] = found_val or spec["enum"][0]
+                matched = next((c for c in spec["enum"] if str(c).lower() in transcript.lower()), spec["enum"][0])
+                args[key] = matched
             else:
                 args[key] = svc
         elif spec.get("type") == "integer":
@@ -221,10 +208,9 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
     ev_lines = extract_evidence_lines(transcript)
     all_ev_ids = [lid for lid, _ in ev_lines]
 
-    # Best root cause determination
+    # Deterministic base
     best_cause = allowed_causes[0] if allowed_causes else "unknown"
     best_score = -1
-
     for cause in allowed_causes:
         tokens = [w for w in re.split(r"[_ -]+", cause.lower()) if len(w) > 3]
         score = sum(t_lower.count(tok) for tok in tokens)
@@ -232,27 +218,34 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
             best_score = score
             best_cause = cause
 
-    # 2 to 4 genuine evidence IDs
+    # 2 to 4 valid line IDs
     cause_tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
     relevant_ids = []
     for lid, txt in ev_lines:
         tl = txt.lower()
         if any(tok in tl for tok in cause_tokens) or any(w in tl for w in ["error", "failure", "timeout", "latency", "exhaust", "high", "alert"]):
             relevant_ids.append(lid)
-
     if len(relevant_ids) < 2:
         relevant_ids = (relevant_ids + all_ev_ids)[:2]
-    selected_evidence = relevant_ids[:3] if relevant_ids else ["ev_1", "ev_2"]
+    selected_evidence = relevant_ids[:3] if relevant_ids else all_ev_ids[:2]
 
-    # 1 or 2 targeted diagnostic dispatches
-    diagnostics = []
-    for t in diag_catalog[:min(1, max_diag)]:
-        targs = build_tool_args(t.get("inputSchema", {}), inc, transcript)
-        diagnostics.append({
-            "toolName": t["name"],
-            "arguments": targs,
-            "evidence": [selected_evidence[0]]
-        })
+    # Select best matching diagnostic tool based on transcript keywords
+    def rank_diag_tool(tool):
+        name = tool["name"].lower()
+        score = 0
+        if "metric" in name and ("metric" in t_lower or "cpu" in t_lower or "utilization" in t_lower):
+            score += 5
+        if "log" in name and ("log" in t_lower or "error" in t_lower or "exception" in t_lower):
+            score += 5
+        if "trace" in name and ("span" in t_lower or "latency" in t_lower):
+            score += 4
+        if "health" in name or "status" in name:
+            score += 2
+        return score
+
+    sorted_diags = sorted(diag_catalog, key=rank_diag_tool, reverse=True)
+    chosen_tool = sorted_diags[0] if sorted_diags else catalog[0]
+    diag_args = build_fallback_args(chosen_tool.get("inputSchema", {}), inc, transcript)
 
     # Scaling limit check
     is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
@@ -264,24 +257,33 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         effect_tool = list(effect_tools)[0] if effect_tools else "scale_service"
 
     eff_spec = next((t for t in catalog if t["name"] == effect_tool), None)
-    eff_args = build_tool_args(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
+    eff_args = build_fallback_args(eff_spec.get("inputSchema", {}), inc, transcript) if eff_spec else {"service": inc.get("service", "core")}
 
     plan = {
         "rootCause": best_cause,
         "evidence": selected_evidence,
-        "diagnostics": diagnostics,
+        "diagnostics": [{
+            "toolName": chosen_tool["name"],
+            "arguments": diag_args,
+            "evidence": [selected_evidence[0]]
+        }],
         "effectTool": effect_tool,
         "effectArguments": eff_args
     }
 
-    # Model refine via Gemini if credentials exist
+    # Full LLM Planner with Tool Catalog and Arguments
     if LLM_API_KEY:
         try:
+            diag_specs = [{"name": t["name"], "schema": t.get("inputSchema", {})} for t in diag_catalog]
             prompt = (
-                f"Incident: {inc.get('title')}. Allowed Root Causes: {json.dumps(allowed_causes)}.\n"
-                f"Transcript evidence:\n{transcript[:6000]}\n\n"
-                f"Select: 1 root cause from Allowed Root Causes and 2-4 exact bracketed IDs present in transcript. "
-                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"id1\",\"id2\"]}}"
+                f"Service: {inc.get('service')}, Title: {inc.get('title')}.\n"
+                f"Transcript snippet:\n{transcript[:5000]}\n\n"
+                f"Allowed Root Causes: {json.dumps(allowed_causes)}\n"
+                f"Diagnostic Tool Catalog: {json.dumps(diag_specs)}\n"
+                f"Rule: Choose exactly 1 root cause from Allowed Root Causes, 2 to 4 bracketed evidence IDs from transcript, "
+                f"and 1 diagnostic tool from catalog with arguments derived from the transcript.\n"
+                f"Return JSON: {{\"rootCause\":\"...\", \"evidence\":[\"ev_1\",\"ev_2\"], "
+                f"\"diagnosticTool\":\"<name>\", \"diagnosticArgs\":{{}}}}"
             )
             async with httpx.AsyncClient(timeout=httpx.Timeout(9.0, connect=2.5)) as client:
                 r = await client.post(
@@ -303,10 +305,18 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
                     valid_ev = [x for x in parsed.get("evidence", []) if x in all_ev_ids]
                     if len(valid_ev) >= 2:
                         plan["evidence"] = valid_ev[:4]
-                        if plan["diagnostics"]:
-                            plan["diagnostics"][0]["evidence"] = [plan["evidence"][0]]
-        except Exception:
-            pass
+
+                    tool_n = parsed.get("diagnosticTool")
+                    matched_t = next((t for t in diag_catalog if t["name"] == tool_n), None)
+                    if matched_t:
+                        t_args = parsed.get("diagnosticArgs") or build_fallback_args(matched_t.get("inputSchema", {}), inc, transcript)
+                        plan["diagnostics"] = [{
+                            "toolName": matched_t["name"],
+                            "arguments": t_args,
+                            "evidence": [plan["evidence"][0]]
+                        }]
+        except Exception as e:
+            print(f"LLM refine exception: {e}", flush=True)
 
     return plan, model_span
 
