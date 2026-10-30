@@ -12,12 +12,12 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.getenv("DB_PATH", "incident_v3.db")
+DB_PATH = os.getenv("DB_PATH", "incident_v4.db")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 
-app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.1.0")
+app = FastAPI(title="GA5 Observable Incident Triage Agent", version="3.2.0")
 
 
 def db():
@@ -32,7 +32,7 @@ def init_db():
             run_id TEXT PRIMARY KEY,
             request_hash TEXT NOT NULL,
             state_json TEXT NOT NULL,
-            public_response TEXT NOT NULL
+            last_response TEXT NOT NULL
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS receipts(
             receipt_id TEXT PRIMARY KEY,
@@ -82,11 +82,11 @@ def span(trace_id, span_id, parent, name, kind, run_id, marker,
         "traceId": trace_id,
         "spanId": span_id,
         "name": name,
-        "kind": kind,
+        "kind": int(kind),
         "startTimeUnixNano": now,
         "endTimeUnixNano": str(time.time_ns()),
         "attributes": attrs,
-        "status": {"code": status_code},
+        "status": {"code": int(status_code)},
     }
     if parent:
         s["parentSpanId"] = parent
@@ -113,16 +113,24 @@ def otlp(state: dict) -> dict:
     }
 
 
-def public(state: dict) -> dict:
-    result = {k: v for k, v in state.items() if not k.startswith("_") and k not in ("pending", "plan", "pendingApproval", "catalog")}
-    result["otlp"] = otlp(state)
-    if state.get("status") == "waiting":
-        result["dispatches"] = state.get("dispatches", [])
-        result["approvals"] = state.get("approvals", [])
+def serialize_public(state: dict) -> dict:
+    res = {
+        "runId": state["runId"],
+        "status": state["status"],
+        "diagnosis": state.get("diagnosis", {}),
+        "chosenEffect": state.get("chosenEffect", ""),
+        "suppressed": state.get("suppressed", []),
+        "actionLog": state.get("actionLog", []),
+        "receiptLog": state.get("receiptLog", []),
+        "otlp": otlp(state)
+    }
+    if state["status"] == "waiting":
+        res["dispatches"] = state.get("dispatches", [])
+        res["approvals"] = state.get("approvals", [])
     else:
-        result["dispatches"] = []
-        result["approvals"] = []
-    return result
+        res["dispatches"] = []
+        res["approvals"] = []
+    return res
 
 
 def load(run_id: str):
@@ -133,12 +141,11 @@ def load(run_id: str):
     return None
 
 
-def save(state: dict):
-    pub = public(state)
+def save_state(state: dict, current_response: dict):
     with db() as c:
-        c.execute("UPDATE runs SET state_json=?, public_response=? WHERE run_id=?",
+        c.execute("UPDATE runs SET state_json=?, last_response=? WHERE run_id=?",
                   (json.dumps(state, separators=(",", ":")),
-                   json.dumps(pub, separators=(",", ":")),
+                   json.dumps(current_response, separators=(",", ":")),
                    state["runId"]))
 
 
@@ -203,7 +210,6 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         {"gen_ai.operation.name": "chat", "gen_ai.request.model": LLM_MODEL},
     )
 
-    # Heuristic scoring of allowed causes against transcript
     t_lower = transcript.lower()
     best_cause = allowed[0] if allowed else "database_connection_exhaustion"
     best_score = -1
@@ -215,7 +221,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
             best_score = score
             best_cause = cause
 
-    # 2 to 4 bracketed evidence IDs
+    # 2 to 4 evidence IDs
     ev_matches = []
     tokens = [w for w in re.split(r"[_ -]+", best_cause.lower()) if len(w) > 3]
     for lid, txt in ev_dict.items():
@@ -238,8 +244,8 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
             "evidence": [evidence_ids[0]]
         })
 
-    # Rule: If at scaling limit, page oncall/owner instead of scaling
-    is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum"])
+    # Rule: When a service is already at its permitted scaling limit, page the owner instead of scaling
+    is_at_scale_limit = any(w in t_lower for w in ["scaling limit", "limit reached", "max replicas", "already at maximum", "cannot scale"])
     if is_at_scale_limit and "page_oncall" in effect_tools:
         effect_tool = "page_oncall"
     elif is_at_scale_limit and "page_owner" in effect_tools:
@@ -258,7 +264,7 @@ async def plan_incident(req: dict, trace_id: str, agent_span_id: str):
         "effectArguments": eff_args
     }
 
-    # Direct Gemini / LLM call if credentials available
+    # Low-cost planning refine if API is configured
     if LLM_API_KEY:
         try:
             prompt = (
@@ -381,13 +387,13 @@ async def create_incident(request: Request, req: dict = Body(...)):
     rid = str(req["runId"])
     req_hash = sha({k: v for k, v in req.items() if k != "sensitive"})
 
-    # Exact replay check & changed-content 409 conflict
+    # Exact replay check & 409 conflict detection
     with db() as c:
-        row = c.execute("SELECT request_hash, public_response FROM runs WHERE run_id=?", (rid,)).fetchone()
+        row = c.execute("SELECT request_hash, last_response FROM runs WHERE run_id=?", (rid,)).fetchone()
         if row:
             if row["request_hash"] != req_hash:
                 raise HTTPException(409, "runId content conflict")
-            return JSONResponse(json.loads(row["public_response"]))
+            return JSONResponse(json.loads(row["last_response"]))
 
     trace_id, incoming_parent, tracestate = trace_context(request)
     server_id = hx(8)
@@ -429,18 +435,18 @@ async def create_incident(request: Request, req: dict = Body(...)):
             state, item["toolName"], item["arguments"], "diagnostic", item["evidence"]
         ))
 
-    # incident.join span when diagnostics fan out
+    # incident.join span connects independent diagnostics
     if len(state["dispatches"]) > 1:
         links = [{"traceId": trace_id, "spanId": state["pending"][d["actionId"]]["logicalSpanId"]}
                  for d in state["dispatches"]]
         state["_spans"].append(span(trace_id, hx(8), agent_id, "incident.join", 1, rid, state["publicMarker"], links=links))
 
-    pub_response = public(state)
+    initial_response = serialize_public(state)
     with db() as c:
-        c.execute("INSERT INTO runs(run_id, request_hash, state_json, public_response) VALUES(?,?,?,?)",
-                  (rid, req_hash, json.dumps(state, separators=(",", ":")), json.dumps(pub_response, separators=(",", ":"))))
+        c.execute("INSERT INTO runs(run_id, request_hash, state_json, last_response) VALUES(?,?,?,?)",
+                  (rid, req_hash, json.dumps(state, separators=(",", ":")), json.dumps(initial_response, separators=(",", ":"))))
 
-    return JSONResponse(pub_response)
+    return JSONResponse(initial_response)
 
 
 def maybe_advance(state: dict):
@@ -523,7 +529,7 @@ async def receipt(run_id: str, body: dict = Body(...)):
     if previous:
         if previous["run_id"] != run_id or previous["content_hash"] != body_hash:
             raise HTTPException(409, "receiptId content conflict")
-        return JSONResponse(public(state))
+        return JSONResponse(serialize_public(state))
 
     if state["status"] != "waiting":
         raise HTTPException(422, "No pending work")
@@ -632,13 +638,15 @@ async def receipt(run_id: str, body: dict = Body(...)):
             c.execute("INSERT INTO receipts(receipt_id, run_id, content_hash, body_json) VALUES(?,?,?,?)",
                       (receipt_id, run_id, body_hash, json.dumps(body)))
 
-    save(state)
-    return JSONResponse(public(state))
+    current_resp = serialize_public(state)
+    save_state(state, current_resp)
+    return JSONResponse(current_resp)
 
 
 @app.get("/v2/incidents/{run_id}")
 async def get_incident(run_id: str):
-    state = load(run_id)
-    if not state:
+    with db() as c:
+        row = c.execute("SELECT last_response FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    if not row:
         raise HTTPException(404, "Unknown runId")
-    return JSONResponse(public(state))
+    return JSONResponse(json.loads(row["last_response"]))
